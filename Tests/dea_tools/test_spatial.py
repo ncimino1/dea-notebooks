@@ -4,8 +4,10 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import geopandas as gpd
+from shapely.geometry import Point, LineString, Polygon
 
 import datacube
+from odc.geo.geom import Geometry
 from datacube.utils.masking import mask_invalid_data
 
 from dea_tools.spatial import subpixel_contours, xr_vectorize, xr_rasterize
@@ -13,7 +15,7 @@ from dea_tools.spatial import subpixel_contours, xr_vectorize, xr_rasterize
 
 @pytest.fixture(
     params=[
-        None,  # Default WGS84
+        "EPSG:4326",  # WGS84
         "EPSG:3577",  # Australian Albers
         "EPSG:32756",  # UTM 56S
     ],
@@ -34,13 +36,13 @@ def dem_da(request):
     return da
 
 
-# Create test data in different CRSs and resolutions
+# Create standard datacube load data in different CRSs and resolutions
 @pytest.fixture(
     params=[
-        ("EPSG:3577", (-30, 30)),  # Australian Albers 30 m pixels
         ("EPSG:4326", (-0.00025, 0.00025)),  # WGS84, 0.0025 degree pixels
+        ("EPSG:3577", (-30, 30)),  # Australian Albers 30 m pixels
     ],
-    ids=["satellite_da_epsg3577", "satellite_da_epsg4326"],
+    ids=["satellite_da_epsg4326", "satellite_da_epsg3577"],
 )
 def satellite_da(request):
     # Obtain CRS and resolution params
@@ -49,7 +51,7 @@ def satellite_da(request):
     # Connect to datacube
     dc = datacube.Datacube()
 
-    # Load example satellite data around Broome tide gauge
+    # Load example satellite data
     ds = dc.load(
         product="ga_ls8c_ard_3",
         measurements=["nbart_nir"],
@@ -68,9 +70,41 @@ def satellite_da(request):
     return ds.nbart_nir
 
 
+# Create single pixel sample data in different CRSs
 @pytest.fixture(
     params=[
-        None,  # Default WGS84
+        "EPSG:4326",  # WGS84
+        "EPSG:3577",  # Australian Albers
+    ],
+    ids=["pixel_da_epsg4326", "pixel_da_epsg3577"],
+)
+def pixel_da(request):
+    # Obtain CRS and resolution params
+    crs = request.param
+
+    # Create point geometry to load data with
+    geom_point = Geometry(geom=Point(149.130, -35.284), crs="EPSG:4326")
+
+    # Connect to datacube
+    dc = datacube.Datacube()
+
+    # Load example satellite data
+    ds = dc.load(
+        product="ga_ls8c_ard_3",
+        measurements=["nbart_nir"],
+        geopolygon=geom_point,
+        time="2020-01-07",
+        output_crs=crs,
+    )
+
+    # Return single array
+    return ds.nbart_nir
+
+
+# Load and reproject categorical raster to use for vectorization/rasterization
+@pytest.fixture(
+    params=[
+        "EPSG:4326",  # WGS84
         "EPSG:3577",  # Australian Albers
         "EPSG:32756",  # UTM 56S
     ],
@@ -85,13 +119,71 @@ def categorical_da(request):
     raster_path = "Tests/data/categorical_raster.tif"
     da = rioxarray.open_rasterio(raster_path).squeeze("band")
 
-    # Reproject if required
+    # Reproject
     crs = request.param
-    if crs:
-        # Reproject and mask out nodata
-        da = da.odc.reproject(crs, resampling="nearest")
+    da = da.odc.reproject(crs, resampling="nearest")
 
     return da
+
+
+# Create test GeoDataFrame data with different geometries and CRSs
+@pytest.fixture(
+    params=[
+        ("point", "EPSG:4326"),  # Point geometry, WGS84
+        ("line", "EPSG:4326"),  # Line geometry, WGS84
+        ("poly", "EPSG:4326"),  # Polygon geometry, WGS84
+        ("all", "EPSG:4326"),  # Multiple, WGS84
+        ("point", "EPSG:3577"),  # Point geometry, Australian Albers
+        ("line", "EPSG:3577"),  # Line geometry, Australian Albers
+        ("poly", "EPSG:3577"),  # Polygon geometry, Australian Albers
+        ("all", "EPSG:3577"),  # Multiple, Australian Albers
+    ],
+    ids=[
+        "point_epsg4326",
+        "line_epsg4326",
+        "poly_epsg4326",
+        "all_epsg4326",
+        "point_epsg3577",
+        "line_epsg3577",
+        "poly_epsg3577",
+        "all_epsg3577",
+    ],
+)
+def sample_gdf(request):
+    # Obtain geom type and CRS param
+    geom, crs = request.param
+
+    # Create geometries
+    point = Point(149.130, -35.284)
+    line = LineString(((149.134, -35.291), (149.138, -35.294)))
+    poly = Polygon(
+        (
+            (149.144, -35.300),
+            (149.149, -35.300),
+            (149.149, -35.305),
+            (149.144, -35.305),
+        )
+    )
+
+    # Dict containing sample geometries
+    geom_dict = {
+        "point": [point],
+        "line": [line],
+        "poly": [poly],
+        "all": [point, line, poly],
+    }
+
+    # Create geopandas.GeoDataFrame
+    gdf = gpd.GeoDataFrame(
+        data={"attribute": range(1, len(geom_dict[geom]) + 1)},
+        geometry=geom_dict[geom],
+        crs="EPSG:4326",
+    )
+
+    # Reproject to custom CRS
+    gdf = gdf.to_crs(crs)
+
+    return gdf
 
 
 @pytest.mark.parametrize(
@@ -135,6 +227,34 @@ def test_xr_vectorize_output_path(categorical_da):
     assert gpd.read_file("testing.geojson").equals(categorical_gdf)
 
 
+def test_xr_rasterize(categorical_da, sample_gdf):
+    """
+    Tests xr_rasterize against many combinations of input rasters CRSs,
+    and geodataframes (with point, line, polygon and combined features)
+    in different CRSs.
+    """
+    # Rasterize vector
+    rasterized_da = xr_rasterize(
+        gdf=sample_gdf,
+        da=categorical_da,
+    )
+
+    # Assert that output is an xarray.DataArray
+    assert isinstance(rasterized_da, xr.DataArray)
+
+    # Assert that output has same Geobox as input
+    assert rasterized_da.odc.geobox == categorical_da.odc.geobox
+
+    # Assert coordinates match in input and output
+    in_y, in_x = categorical_da.odc.spatial_dims
+    out_y, out_x = rasterized_da.odc.spatial_dims
+    assert np.allclose(rasterized_da.coords[out_x], categorical_da.coords[in_x])
+    assert np.allclose(rasterized_da.coords[out_y], categorical_da.coords[in_y])
+
+    # Assert that outputs have at least one valid value
+    assert rasterized_da.sum() > 0
+
+
 @pytest.mark.parametrize(
     "name",
     [
@@ -142,7 +262,11 @@ def test_xr_vectorize_output_path(categorical_da):
         "testing",  # Use custom output array name
     ],
 )
-def test_xr_rasterize(categorical_da, name):
+def test_xr_rasterize_roundtrip(categorical_da, name):
+    """
+    Tests whether a raster can be vectorized then rasterized and finish
+    up identical to the original input.
+    """
     # Create vector to rasterize
     categorical_gdf = xr_vectorize(categorical_da)
 
@@ -177,6 +301,33 @@ def test_xr_rasterize_output_path(categorical_da):
     # Assert that output GeoTIFF data is same as input
     loaded_da = rioxarray.open_rasterio("testing.tif").squeeze("band")
     assert np.allclose(loaded_da, rasterized_da)
+
+
+def test_xr_rasterize_pixel(pixel_da, sample_gdf):
+    """
+    Tests if we can succesfully rasterize data into an xarray dataset
+    with a single pixel (relevant to machine learning applications)
+    """
+    # Rasterize vector into footprint of single pixel dataset
+    rasterized_da = xr_rasterize(
+        gdf=sample_gdf,
+        da=pixel_da,
+    )
+    
+    # Assert that output is an xarray.DataArray
+    assert isinstance(rasterized_da, xr.DataArray)
+
+
+def test_xr_vectorize_pixel(pixel_da):
+    """
+    Tests if we can succesfully vectorize an xarray dataset with a 
+    single pixel (relevant to machine learning applications).
+    """
+    # Vectorize single pixel dataset
+    vectorized_gdf = xr_vectorize(pixel_da)
+    
+    # Assert that output is a geopandas.GeoDataFrame
+    assert isinstance(vectorized_gdf, gpd.GeoDataFrame)
 
 
 def test_subpixel_contours_dataseterror(dem_da):
